@@ -48,6 +48,14 @@ jobs:
           cd ~/android/lineage
           repo sync -c -j4 --force-sync --no-clone-bundle --no-tags
 
+      - name: Cache CCACHE
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-goyave3g-${{ github.run_id }}
+          restore-keys: |
+            ccache-goyave3g-
+
       - name: Build ROM (goyave3g)
         run: |
           sudo apt-get update && sudo apt-get install -y python2
@@ -58,6 +66,8 @@ jobs:
           export PATH=$JAVA_HOME/bin:~/bin:$PATH
           export LC_ALL=C
           export USE_CCACHE=1
+          export CCACHE_DIR=~/.ccache
+          ccache -M 8G
           export ANDROID_JACK_VM_ARGS="-Dfile.encoding=UTF-8 -XX:+TieredCompilation -Xmx4G"
           cd ~/android/lineage
           source build/envsetup.sh
