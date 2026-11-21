@@ -50,7 +50,9 @@ jobs:
 
       - name: Build ROM (goyave3g)
         run: |
-          export PATH=~/bin:$PATH
+          sudo update-java-alternatives -s java-1.8.0-openjdk-amd64 || true
+          export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+          export PATH=$JAVA_HOME/bin:~/bin:$PATH
           export LC_ALL=C
           export USE_CCACHE=1
           cd ~/android/lineage
