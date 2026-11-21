@@ -55,7 +55,7 @@ jobs:
           export USE_CCACHE=1
           cd ~/android/lineage
           source build/envsetup.sh
-          breakfast goyave3g
+          lunch lineage_goyave3g-userdebug
           mka bacon
 
       - name: Upload Built ROM to GitHub Releases
