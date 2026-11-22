@@ -5,35 +5,43 @@ on:
 
 jobs:
   build:
+    name: Build ROM for goyave3g
     runs-on: ubuntu-22.04
+
     steps:
-      - name: Maximize Disk Space
+      - name: Maximize Build Space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
           df -h
 
       - name: Install Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python-is-python3 openjdk-8-jdk
+          sudo apt-get install -y python2 bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev openjdk-8-jdk
+          sudo ln -sf /usr/bin/python2 /usr/bin/python
+          sudo update-java-alternatives -s java-1.8.0-openjdk-amd64 || true
+          sudo sed -i 's/TLSv1, TLSv1.1, //g' /usr/lib/jvm/java-8-openjdk-amd64/jre/lib/security/java.security
+
+      - name: Install Repo Tool
+        run: |
           mkdir -p ~/bin
-          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
           chmod a+x ~/bin/repo
 
-      - name: Initialize LineageOS 14.1 Repo
+      - name: Initialize & Sync LineageOS 14.1 Source
         run: |
           export PATH=~/bin:$PATH
-          git config --global user.email "builder@github.com"
-          git config --global user.name "GitHub Builder"
+          git config --global user.name "shipper10"
+          git config --global user.email "shipper10@users.noreply.github.com"
+          git config --global color.ui false
           mkdir -p ~/android/lineage
           cd ~/android/lineage
           repo init -u https://github.com/LineageOS/android.git -b cm-14.1 --depth=1
-
-      - name: Configure Local Manifests (Claude RIL Fix)
-        run: |
-          mkdir -p ~/android/lineage/.repo/local_manifests
-          cat << 'EOF' > ~/android/lineage/.repo/local_manifests/goyave3g.xml
+          mkdir -p .repo/local_manifests
+          cat << 'EOF' > .repo/local_manifests/goyave3g.xml
           <?xml version="1.0" encoding="UTF-8"?>
           <manifest>
             <project name="shipper10/android_device_samsung_goyave3g" path="device/samsung/goyave3g" remote="github" revision="cm-14.1-ril-fix" />
@@ -41,12 +49,7 @@ jobs:
             <project name="LineageOS/android_hardware_samsung" path="hardware/samsung" remote="github" revision="cm-14.1" />
           </manifest>
           EOF
-
-      - name: Sync Source Code
-        run: |
-          export PATH=~/bin:$PATH
-          cd ~/android/lineage
-          repo sync -c -j4 --force-sync --no-clone-bundle --no-tags
+          repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
 
       - name: Cache CCACHE
         uses: actions/cache@v4
@@ -58,10 +61,6 @@ jobs:
 
       - name: Build ROM (goyave3g)
         run: |
-          sudo apt-get update && sudo apt-get install -y python2 bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev
-          sudo ln -sf /usr/bin/python2 /usr/bin/python
-          sudo update-java-alternatives -s java-1.8.0-openjdk-amd64 || true
-          sudo sed -i 's/TLSv1, TLSv1.1, //g' /usr/lib/jvm/java-8-openjdk-amd64/jre/lib/security/java.security
           export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
           export PATH=$JAVA_HOME/bin:~/bin:$PATH
           export LC_ALL=C
@@ -72,6 +71,7 @@ jobs:
           export ANDROID_JACK_VM_ARGS="-Dfile.encoding=UTF-8 -XX:+TieredCompilation -Xmx6g"
           export JACK_SERVER_VM_ARGUMENTS="-Dfile.encoding=UTF-8 -XX:+TieredCompilation -Xmx6g"
           cd ~/android/lineage
+          sed -i '/system_file:file execmod/d' system/sepolicy/domain.te
           ./prebuilts/sdk/tools/jack-admin install-server ./prebuilts/sdk/tools/jack-launcher.jar ./prebuilts/sdk/tools/jack-server-4.8.ALPHA.jar || true
           ./prebuilts/sdk/tools/jack-admin start-server || true
           source build/envsetup.sh
@@ -79,10 +79,8 @@ jobs:
           mka framework-res org.cyanogenmod.platform-res
           mka bacon
 
-      - name: Upload Built ROM to GitHub Releases
-        uses: softprops/action-gh-release@v2
+      - name: Upload Built ROM
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: build-${{ github.run_number }}
-          name: LineageOS 14.1 SM-T116 Build #${{ github.run_number }}
-          files: |
-            /home/runner/android/lineage/out/target/product/goyave3g/lineage-14.1-*.zip
+          name: LineageOS-14.1-goyave3g
+          path: ~/android/lineage/out/target/product/goyave3g/lineage-14.1-*.zip
