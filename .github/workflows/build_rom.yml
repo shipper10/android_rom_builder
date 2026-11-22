@@ -7,6 +7,7 @@ jobs:
   build:
     name: Build ROM for goyave3g
     runs-on: ubuntu-22.04
+    timeout-minutes: 360
 
     steps:
       - name: Maximize Build Space
@@ -66,104 +67,55 @@ jobs:
           restore-keys: |
             ccache-goyave3g-
 
-      - name: Apply Device Patches & Compatibility Fixes
+      - name: Pre-flight checks (device tree sanity)
         run: |
           cd ~/android/lineage
-          PATCH_DIR="$HOME/android/lineage/device/samsung/goyave3g/patches"
+          D=device/samsung/goyave3g
+          fail=0
+          for f in kernel dt.img configs/audio/audio_policy.conf configs/gps/gps.xml \
+                   libs/libmemoryheapion_sprd/Android.mk libs/libion_sprd/Android.mk \
+                   libs/compat/sprd_compat.h patches/cm-14.1/external_tinyalsa.diff \
+                   patches/cm-14.1/frameworks_av.diff; do
+            [ -e "$D/$f" ] || { echo "MISSING: $D/$f"; fail=1; }
+          done
+          # Every PRODUCT_COPY_FILES source that lives in the device tree must exist
+          grep -ohE '\$\(LOCAL_PATH\)/[A-Za-z0-9_./-]+' $D/device.mk $D/device_goyave3g.mk | sort -u | while read -r p; do
+            q="$D/${p#\$(LOCAL_PATH)/}"
+            [ -e "$q" ] || echo "WARNING: referenced but missing: $q"
+          done
+          # GCC-only flag must not be active (breaks clang with -mapcs)
+          if grep -E '^[[:space:]]*HWUI_COMPILE_FOR_PERF' $D/BoardConfig.mk; then echo "HWUI_COMPILE_FOR_PERF still active"; fail=1; fi
+          grep -q '^TARGET_NEEDS_PLATFORM_TEXT_RELOCATIONS := true' $D/BoardConfig.mk || { echo "TEXT_RELOCATIONS missing"; fail=1; }
+          if grep -rn execmod $D/sepolicy/; then echo "execmod rules present in sepolicy"; fail=1; fi
+          exit $fail
+
+      - name: Apply AOSP Patches (idempotent, strict)
+        run: |
+          set -e
+          cd ~/android/lineage
+          PATCH_DIR="$PWD/device/samsung/goyave3g/patches/cm-14.1"
 
           apply_patch() {
-            local target_dir="$1"
-            local patch_name="$2"
-            local patch_file="$PATCH_DIR/$patch_name"
-            echo "=== Applying $patch_name -> $target_dir ==="
-            if [ ! -f "$patch_file" ]; then
-              echo "ERROR: Patch file not found: $patch_file"
+            local repo_dir="$1" patch_file="$PATCH_DIR/$2"
+            echo "=== $2 -> $repo_dir ==="
+            [ -f "$patch_file" ] || { echo "ERROR: $patch_file not found"; exit 1; }
+            cd "$repo_dir"
+            if git apply -R --check "$patch_file" 2>/dev/null; then
+              echo "already applied, skipping"
+            elif git apply --check "$patch_file"; then
+              git apply "$patch_file"
+              echo "applied cleanly"
+            else
+              echo "ERROR: $2 neither applies nor is already applied on $repo_dir"
+              git log -1 --oneline
               exit 1
             fi
-
-            if grep -qE "^(\+\+\+|---) (a/|b/)?${target_dir}/" "$patch_file"; then
-              RUN_DIR="$HOME/android/lineage"
-            else
-              RUN_DIR="$HOME/android/lineage/$target_dir"
-            fi
-
-            if grep -qE "^--- a/" "$patch_file"; then
-              PLEVEL=1
-            else
-              PLEVEL=0
-            fi
-
-            (
-              cd "$RUN_DIR"
-              if git apply --check "$patch_file" 2>/dev/null; then
-                git apply "$patch_file"
-                echo "Applied cleanly with git apply."
-              else
-                echo "git apply needs fuzz, trying patch -p${PLEVEL}..."
-                if ! patch -p"$PLEVEL" -N -F 5 --no-backup-if-mismatch < "$patch_file"; then
-                  echo "FAILED HUNKS in $patch_name:"
-                  find . -name "*.rej" -exec echo "--- {} ---" \; -exec cat {} \;
-                  exit 1
-                fi
-                echo "Applied with patch -p${PLEVEL}."
-              fi
-            )
+            cd - >/dev/null
           }
 
-          # Apply all 7 device tree patches
-          apply_patch "external/tinyalsa" "external_tinyalsa.diff"
-          apply_patch "frameworks/av" "frameworks_av.diff"
-          apply_patch "frameworks/base" "frameworks_base.diff"
-          apply_patch "frameworks/native" "frameworks_native.diff"
-          apply_patch "hardware/libhardware" "hardware_libhardware.diff"
-          apply_patch "hardware/libhardware_legacy" "hardware_libhardware_legacy.diff"
-          apply_patch "system/core" "system_core.diff"
-
-          # 1. Disable GCC-only flag in BoardConfig.mk (prevents Clang -mapcs error)
-          sed -i '/HWUI_COMPILE_FOR_PERF/d' device/samsung/goyave3g/BoardConfig.mk
-
-          # 2. Enable KitKat text relocations support officially for bionic linker & sepolicy
-          grep -q "TARGET_NEEDS_PLATFORM_TEXT_RELOCATIONS" device/samsung/goyave3g/BoardConfig.mk || echo "TARGET_NEEDS_PLATFORM_TEXT_RELOCATIONS := true" >> device/samsung/goyave3g/BoardConfig.mk
-
-          # 3. Remove conflicting execmod lines in device sepolicy cleanly (m4-safe)
-          grep -rl "execmod" device/samsung/goyave3g/sepolicy/ | xargs -r sed -i '/execmod/d'
-
-          # 4. Provide isolated userspace stubs for libvbeffect (fixes asm/io.h & asm/div64.h)
-          mkdir -p device/samsung/goyave3g/libs/audio/vb_effect/asm
-          cat << 'EOF' > device/samsung/goyave3g/libs/audio/vb_effect/asm/io.h
-          #ifndef _VB_EFFECT_LOCAL_ASM_IO_H
-          #define _VB_EFFECT_LOCAL_ASM_IO_H
-          #include <stdint.h>
-          #endif
-          EOF
-
-          cat << 'EOF' > device/samsung/goyave3g/libs/audio/vb_effect/asm/div64.h
-          #ifndef _VB_EFFECT_LOCAL_ASM_DIV64_H
-          #define _VB_EFFECT_LOCAL_ASM_DIV64_H
-          #include <stdint.h>
-
-          #define do_div(n, base) ({ \
-              uint32_t __base = (base); \
-              uint32_t __rem; \
-              __rem = ((uint64_t)(n)) % __base; \
-              (n) = ((uint64_t)(n)) / __base; \
-              __rem; \
-          })
-
-          static inline uint64_t div_u64_rem(uint64_t dividend, uint32_t divisor, uint32_t *remainder) {
-              *remainder = dividend % divisor;
-              return dividend / divisor;
-          }
-
-          static inline uint64_t div_u64(uint64_t dividend, uint32_t divisor) {
-              return dividend / divisor;
-          }
-
-          static inline int64_t div_s64(int64_t dividend, int32_t divisor) {
-              return dividend / divisor;
-          }
-          #endif
-          EOF
+          # Only what cannot live inside the device tree:
+          apply_patch external/tinyalsa "external_tinyalsa.diff"   # pcm_set_samplerate()
+          apply_patch frameworks/av     "frameworks_av.diff"       # ACodec: SPRD decoder pixel formats
 
       - name: Build ROM (goyave3g)
         run: |
@@ -191,8 +143,9 @@ jobs:
 
           source build/envsetup.sh
           lunch lineage_goyave3g-userdebug
-          mka -j"$JOBS" framework-res org.cyanogenmod.platform-res
-          mka -j"$JOBS" bacon
+          set -o pipefail
+          mka -j"$JOBS" framework-res org.cyanogenmod.platform-res 2>&1 | tee ~/build_prebuild.log
+          mka -j"$JOBS" bacon 2>&1 | tee ~/build_bacon.log
           ccache -s
 
       - name: Save CCACHE
@@ -203,8 +156,23 @@ jobs:
           path: ~/.ccache
           key: ccache-goyave3g-${{ github.run_id }}-${{ github.run_attempt }}
 
+      - name: Upload Build Logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            ~/build_prebuild.log
+            ~/build_bacon.log
+            ~/android/lineage/out/error.log
+          if-no-files-found: ignore
+
       - name: Upload Built ROM
         uses: actions/upload-artifact@v4
         with:
           name: LineageOS-14.1-goyave3g
-          path: ~/android/lineage/out/target/product/goyave3g/lineage-14.1-*.zip
+          path: |
+            ~/android/lineage/out/target/product/goyave3g/lineage-14.1-*.zip
+            ~/android/lineage/out/target/product/goyave3g/lineage-14.1-*.zip.md5sum
+          if-no-files-found: error
