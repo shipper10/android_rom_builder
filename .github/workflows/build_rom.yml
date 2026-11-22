@@ -71,7 +71,7 @@ jobs:
           export ANDROID_JACK_VM_ARGS="-Dfile.encoding=UTF-8 -XX:+TieredCompilation -Xmx6g"
           export JACK_SERVER_VM_ARGUMENTS="-Dfile.encoding=UTF-8 -XX:+TieredCompilation -Xmx6g"
           cd ~/android/lineage
-          sed -i '/system_file:file execmod/d' system/sepolicy/domain.te
+          grep -rl "execmod" device/samsung/goyave3g/sepolicy/ | xargs -r sed -i '/execmod/s/^/# /'
           ./prebuilts/sdk/tools/jack-admin install-server ./prebuilts/sdk/tools/jack-launcher.jar ./prebuilts/sdk/tools/jack-server-4.8.ALPHA.jar || true
           ./prebuilts/sdk/tools/jack-admin start-server || true
           source build/envsetup.sh
