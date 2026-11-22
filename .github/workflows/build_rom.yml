@@ -13,7 +13,8 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/android
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
           df -h
 
@@ -21,6 +22,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python2 bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev openjdk-8-jdk
+          sudo apt-get clean
           sudo ln -sf /usr/bin/python2 /usr/bin/python
           sudo update-java-alternatives -s java-1.8.0-openjdk-amd64 || true
           sudo sed -i 's/TLSv1, TLSv1.1, //g' /usr/lib/jvm/java-8-openjdk-amd64/jre/lib/security/java.security
@@ -28,7 +30,7 @@ jobs:
       - name: Install Repo Tool
         run: |
           mkdir -p ~/bin
-          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
           chmod a+x ~/bin/repo
 
       - name: Initialize & Sync LineageOS 14.1 Source
@@ -51,13 +53,63 @@ jobs:
           EOF
           repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
 
-      - name: Cache CCACHE
-        uses: actions/cache@v4
+      - name: Restore CCACHE
+        uses: actions/cache/restore@v4
         with:
           path: ~/.ccache
-          key: ccache-goyave3g-${{ github.run_id }}
+          key: ccache-goyave3g-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             ccache-goyave3g-
+
+      - name: Apply Device & Compatibility Fixes
+        run: |
+          cd ~/android/lineage
+
+          # 1. Disable GCC-only flag in BoardConfig.mk (prevents Clang -mapcs error)
+          sed -i '/HWUI_COMPILE_FOR_PERF/d' device/samsung/goyave3g/BoardConfig.mk
+
+          # 2. Enable KitKat text relocations support officially for bionic linker & sepolicy
+          grep -q "TARGET_NEEDS_PLATFORM_TEXT_RELOCATIONS" device/samsung/goyave3g/BoardConfig.mk || echo "TARGET_NEEDS_PLATFORM_TEXT_RELOCATIONS := true" >> device/samsung/goyave3g/BoardConfig.mk
+
+          # 3. Remove conflicting execmod lines in device sepolicy cleanly (m4-safe)
+          grep -rl "execmod" device/samsung/goyave3g/sepolicy/ | xargs -r sed -i '/execmod/d'
+
+          # 4. Provide isolated userspace stubs for libvbeffect (fixes asm/io.h & asm/div64.h without polluting global headers)
+          mkdir -p device/samsung/goyave3g/libs/audio/vb_effect/asm
+          cat << 'EOF' > device/samsung/goyave3g/libs/audio/vb_effect/asm/io.h
+          #ifndef _VB_EFFECT_LOCAL_ASM_IO_H
+          #define _VB_EFFECT_LOCAL_ASM_IO_H
+          #include <stdint.h>
+          #endif
+          EOF
+
+          cat << 'EOF' > device/samsung/goyave3g/libs/audio/vb_effect/asm/div64.h
+          #ifndef _VB_EFFECT_LOCAL_ASM_DIV64_H
+          #define _VB_EFFECT_LOCAL_ASM_DIV64_H
+          #include <stdint.h>
+
+          #define do_div(n, base) ({ \
+              uint32_t __base = (base); \
+              uint32_t __rem; \
+              __rem = ((uint64_t)(n)) % __base; \
+              (n) = ((uint64_t)(n)) / __base; \
+              __rem; \
+          })
+
+          static inline uint64_t div_u64_rem(uint64_t dividend, uint32_t divisor, uint32_t *remainder) {
+              *remainder = dividend % divisor;
+              return dividend / divisor;
+          }
+
+          static inline uint64_t div_u64(uint64_t dividend, uint32_t divisor) {
+              return dividend / divisor;
+          }
+
+          static inline int64_t div_s64(int64_t dividend, int32_t divisor) {
+              return dividend / divisor;
+          }
+          #endif
+          EOF
 
       - name: Build ROM (goyave3g)
         run: |
@@ -66,19 +118,37 @@ jobs:
           export LC_ALL=C
           export USE_CCACHE=1
           export CCACHE_DIR=~/.ccache
-          ccache -M 8G
+          export CCACHE_COMPRESS=1
+          mkdir -p ~/.ccache
+          ccache -M 5G
+
           export _JAVA_OPTIONS="-Xmx4g"
           export ANDROID_JACK_VM_ARGS="-Dfile.encoding=UTF-8 -XX:+TieredCompilation -Xmx4g"
           export JACK_SERVER_VM_ARGUMENTS="-Dfile.encoding=UTF-8 -XX:+TieredCompilation -Xmx4g"
+
           cd ~/android/lineage
-          grep -rl "execmod" device/samsung/goyave3g/sepolicy/ | xargs -r sed -i '/execmod/d'
-          ./prebuilts/sdk/tools/jack-admin install-server ./prebuilts/sdk/tools/jack-launcher.jar ./prebuilts/sdk/tools/jack-server-4.8.ALPHA.jar || true
+          JACK_JAR=$(ls ./prebuilts/sdk/tools/jack-server-*.jar | head -n 1)
+          ./prebuilts/sdk/tools/jack-admin install-server ./prebuilts/sdk/tools/jack-launcher.jar "$JACK_JAR" || true
           ./prebuilts/sdk/tools/jack-admin start-server || true
+
+          TOTAL_RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
+          if [ "$TOTAL_RAM_GB" -ge 12 ]; then JOBS=$(nproc); else JOBS=2; fi
+          echo "Detected RAM: ${TOTAL_RAM_GB}GB -> Building with -j${JOBS}"
+
           source build/envsetup.sh
           lunch lineage_goyave3g-userdebug
-          mka framework-res org.cyanogenmod.platform-res
-          mka -j2 bacon
-          
+          mka -j"$JOBS" framework-res org.cyanogenmod.platform-res
+          mka -j"$JOBS" bacon
+          ccache -s
+
+      - name: Save CCACHE
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-goyave3g-${{ github.run_id }}-${{ github.run_attempt }}
+
       - name: Upload Built ROM
         uses: actions/upload-artifact@v4
         with:
