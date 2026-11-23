@@ -17,12 +17,15 @@ jobs:
           sudo rm -rf /usr/local/share/boost
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/share/swift /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/local/share/chromium
+          sudo docker image prune --all --force || true
+          sudo apt-get clean || true
           df -h
 
       - name: Install Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python2 bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop patch pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev openjdk-8-jdk
+          sudo apt-get install -y python2 bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev git-lfs liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop patch pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev openjdk-8-jdk
           sudo apt-get clean
           sudo ln -sf /usr/bin/python2 /usr/bin/python
           sudo update-java-alternatives -s java-1.8.0-openjdk-amd64 || true
@@ -58,6 +61,17 @@ jobs:
           if [ ! -d external/stlport ]; then
             git clone --depth=1 -b cm-14.1 https://github.com/LineageOS/android_external_stlport.git external/stlport
           fi
+
+          # external/chromium-webview stores webview.apk in git-lfs; without
+          # this the 'apk' is a text pointer and SignApk fails with ZipException.
+          git lfs install --skip-repo
+          (cd external/chromium-webview && git lfs pull)
+          for f in external/chromium-webview/prebuilt/*/webview.apk; do
+            if ! unzip -tq "$f" >/dev/null 2>&1; then
+              echo "::error::$f is not a valid zip (LFS not fetched?)"; ls -l "$f"; head -c 200 "$f"; exit 1
+            fi
+            ls -l "$f"
+          done
 
       - name: Restore CCACHE
         uses: actions/cache/restore@v4
@@ -147,6 +161,18 @@ jobs:
           mka -j"$JOBS" framework-res org.cyanogenmod.platform-res 2>&1 | tee ~/build_prebuild.log
           mka -j"$JOBS" bacon 2>&1 | tee ~/build_bacon.log
           ccache -s
+
+      - name: Diagnostics on failure (disk, webview.apk)
+        if: failure()
+        run: |
+          df -h || true
+          cd ~/android/lineage 2>/dev/null || exit 0
+          du -sh out 2>/dev/null || true
+          ls -l external/chromium-webview/prebuilt/*/webview.apk || true
+          for f in external/chromium-webview/prebuilt/*/webview.apk; do unzip -tq "$f" | tail -1; done || true
+          d=out/target/product/goyave3g/obj/APPS/webview_intermediates
+          ls -l $d || true
+          for f in $d/package.apk*; do echo "== $f"; unzip -tq "$f" 2>&1 | tail -2; done || true
 
       - name: Save CCACHE
         if: always()
